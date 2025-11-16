@@ -57,18 +57,14 @@ import Anthropic from '@anthropic-ai/sdk'
 
 const canvas = ref(null)
 const mode = ref('draw')
-const drawColor = ref('black')
+const drawColor = ref('blue')
 let path = null
 
 const colors = [
-  { name: 'Black', value: 'black' },
-  { name: 'Red', value: 'red' },
-  { name: 'Blue', value: 'blue' },
-  { name: 'Green', value: 'green' },
-  { name: 'Yellow', value: 'yellow' },
-  { name: 'Orange', value: 'orange' },
-  { name: 'Purple', value: 'purple' },
-  { name: 'Magenta', value: '#FF00FF' },
+  { name: 'WALLS', value: 'blue' },
+  { name: 'DOORS', value: 'green' },
+  { name: 'TEXT', value: 'red' },
+  { name: 'DIMS', value: '#FF00FF' },
 ]
 
 onMounted(() => {
