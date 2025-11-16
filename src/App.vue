@@ -53,6 +53,7 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import paper from 'paper'
+import Anthropic from '@anthropic-ai/sdk'
 
 const canvas = ref(null)
 const mode = ref('draw')
@@ -165,13 +166,271 @@ const removeColinearPoints = (points, angleTolerance = 10) => {
   return cleaned
 }
 
-const send = () => {
-  const paths = paper.project.activeLayer.children
+const send = async () => {
+  console.log('Processing architectural sketch...')
+
+  // Get API key from environment
+  const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
+
+  if (!apiKey) {
+    console.error('API key not found. Please set VITE_ANTHROPIC_API_KEY in your .env file')
+    return
+  }
+
+  try {
+    // Export the canvas as SVG
+    const svg = paper.project.exportSVG({ asString: true })
+    console.log('SVG exported')
+
+    // Option 1: Use API to parse everything from SVG
+    // const architecturalData = await parseArchitecturalSketch(svg, canvas.value, apiKey)
+
+    // Option 2: Use frontend graph for walls/doors, API for rooms
+    const wallPaths = paper.project.activeLayer.children.filter(path => path._style.strokeColor._canvasStyle == 'rgb(0,0,255)')
+    const doorPaths = paper.project.activeLayer.children.filter(path => path._style.strokeColor._canvasStyle == 'rgb(0,128,0)')
+    const dimsPath = paper.project.activeLayer.children.filter(path => path._style.strokeColor._canvasStyle == 'rgb(255,0,255)')
+
+    console.log(paper.project.activeLayer.children)
+
+    // Find bounding box of dimension paths
+    const dimsBoundingBox = findBoundingBox(dimsPath)
+    let length = Math.max(dimsBoundingBox.height, dimsBoundingBox.width)
+    console.log('dims', dimsBoundingBox, length)
+
+    // Extract dimension text/number from paths using Anthropic
+    const dimensionData = await extractDimensionNumber(dimsPath, apiKey)
+    console.log('Extracted dimension data:', dimensionData)
+
+    // Create graph from wall paths
+    let wallGraph = createWallGraph(wallPaths)
+    let doorsData = findDoors(doorPaths, wallGraph)
+
+    // Scale to real world dimensions if we have dimension data
+    if (dimensionData && dimensionData.dimension_value) {
+      const scaled = scaleToRealWorld(
+        wallGraph,
+        doorsData,
+        dimensionData.dimension_value,
+        length
+      )
+      wallGraph = scaled.wallGraph
+      doorsData = scaled.doors
+      console.log(`All coordinates scaled by factor: ${scaled.scaleFactor}`)
+    }
+
+    // Convert wall graph to walls array format
+    const walls = wallGraph.edges.map((edge, idx) => {
+      const [idx1, idx2] = edge
+      const n1 = wallGraph.nodes[idx1]
+      const n2 = wallGraph.nodes[idx2]
+      return {
+        wall_id: `wall_${idx}`,
+        start_point: { x: n1.x, y: n1.y },
+        end_point: { x: n2.x, y: n2.y }
+      }
+    })
+
+    let finalJSON = {
+      walls: walls,
+      doors: doorsData
+    }
+
+    console.log('final', finalJSON)
+
+  } catch (error) {
+    console.error('Error processing architectural sketch:', error)
+  }
+}
+
+const extractDimensionNumber = async (dimPaths, apiKey) => {
+  if (!dimPaths || dimPaths.length === 0) {
+    console.log('No dimension paths to process')
+    return null
+  }
+
+  // Extract all points from dimension paths
+  const pathsData = dimPaths.map(path => {
+    if (!path.segments || path.segments.length === 0) return null
+
+    return {
+      points: path.segments.map(segment => ({
+        x: segment.point.x,
+        y: segment.point.y
+      }))
+    }
+  }).filter(p => p !== null)
+  console.log('pathsData', pathsData)
+
+  const client = new Anthropic({
+    apiKey,
+    dangerouslyAllowBrowser: true
+  })
+
+  const dimensionSchema = {
+    type: "json_schema",
+    schema: {
+      type: "object",
+      properties: {
+        dimension_text: { type: "string" },
+        dimension_value: { type: "number" }
+      },
+      required: ["dimension_text"],
+      additionalProperties: false
+    }
+  }
+
+  const prompt = `I have drawn dimension annotation paths (lines forming text/numbers) in an architectural drawing and annotation lines. Here are the path coordinates:
+
+**PATH POINTS:**
+${JSON.stringify(pathsData, null, 2)}
+
+**TASK:**
+Analyze these path coordinates and determine what text/number they are trying to represent.
+
+**INSTRUCTIONS:**
+1. Some of the points form strokes that represent dimension text (e.g., "24", "12.5", "10'", "24'-6\"", etc.) but some of the points are just dimension lines.
+2. Analyze the path patterns to determine what characters/numbers are being drawn
+3. Return the exact text as dimension_value
+4. If you can parse it to a number, also return "dimension_value"
+
+**COORDINATE SYSTEM:**
+- Each path is a series of (x, y) points
+- Points are connected in order to form strokes
+- Multiple paths may form a single character or multiple characters
+
+**EXAMPLES:**
+- If paths form "24'", return: {"dimension_text": "24'", "dimension_value": 24}
+- If paths form "12'-6\"", return: {"dimension_text": "12'-6\"", "dimension_value": 12.5}
+- If paths form "10", return: {"dimension_text": "10", "dimension_value": 10}
+
+Analyze the paths and extract the dimension text.
+`
+
+  console.log("Extracting dimension text with Anthropic API...")
+  const response = await client.beta.messages.create({
+    model: "claude-sonnet-4-5",
+    max_tokens: 2000,
+    temperature: 0,
+    betas: ["structured-outputs-2025-11-13"],
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: prompt
+          }
+        ]
+      }
+    ],
+    output_format: dimensionSchema
+  })
+
+  if (response.content && response.content.length > 0) {
+    const outputText = response.content[0].text
+
+    try {
+      const parsedData = JSON.parse(outputText)
+      console.log('Extracted dimension:', parsedData)
+      return parsedData
+    } catch (e) {
+      console.error(`Error parsing dimension JSON: ${e}`)
+      return null
+    }
+  }
+
+  return null
+}
+
+const scaleToRealWorld = (wallGraph, doors, dimensionValue, boundingBoxLength) => {
+  // Calculate scale factor: real_world_units per pixel
+  const scaleFactor = 12 / boundingBoxLength
+
+  console.log(`Scale factor: ${dimensionValue} units / ${boundingBoxLength} pixels = ${scaleFactor} units per pixel`)
+
+  // Scale wall graph nodes
+  const scaledWallGraph = {
+    nodes: wallGraph.nodes.map(node => ({
+      x: node.x * scaleFactor,
+      y: node.y * scaleFactor
+    })),
+    edges: wallGraph.edges // Edges reference node indices, so they don't change
+  }
+
+  // Scale door data
+  const scaledDoors = doors.map(door => ({
+    start: {
+      x: door.start.x * scaleFactor,
+      y: door.start.y * scaleFactor
+    },
+    end: {
+      x: door.end.x * scaleFactor,
+      y: door.end.y * scaleFactor
+    },
+    original: door.original // Keep original for reference if needed
+  }))
+
+  console.log('Scaled wall graph nodes:', scaledWallGraph.nodes)
+  console.log('Scaled doors:', scaledDoors)
+
+  return {
+    wallGraph: scaledWallGraph,
+    doors: scaledDoors,
+    scaleFactor
+  }
+}
+
+const findBoundingBox = (paths) => {
+  if (!paths || paths.length === 0) {
+    return {
+      minX: 0,
+      minY: 0,
+      maxX: 0,
+      maxY: 0,
+      width: 0,
+      height: 0
+    }
+  }
+
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+
+  // Iterate through all paths
+  paths.forEach((path) => {
+    if (!path.segments) return
+
+    // Check all segment points
+    path.segments.forEach(segment => {
+      const x = segment.point.x
+      const y = segment.point.y
+
+      minX = Math.min(minX, x)
+      minY = Math.min(minY, y)
+      maxX = Math.max(maxX, x)
+      maxY = Math.max(maxY, y)
+    })
+  })
+
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+    width: maxX - minX,
+    height: maxY - minY,
+    centerX: (minX + maxX) / 2,
+    centerY: (minY + maxY) / 2
+  }
+}
+
+const createWallGraph = (wallPaths) => {
   const graph = {
     nodes: [],
     edges: []
   }
-  const mergeDistance = 25 // pixels
+  const mergeDistance = 40 // pixels
 
   // Helper function to calculate distance between two points
   const distance = (p1, p2) => {
@@ -179,9 +438,9 @@ const send = () => {
   }
 
   // Process each path
-  paths.forEach((path) => {
+  wallPaths.forEach((path) => {
     if (!path.segments) return
-
+    console.log('path', path)
     // Extract points from path segments
     const points = path.segments.map(segment => ({
       x: segment.point.x,
@@ -216,42 +475,141 @@ const send = () => {
     }
   })
 
+  // Snap edges to horizontal/vertical if within 10 degrees
+  const snapTolerance = 10 // degrees
+  graph.edges.forEach(([idx1, idx2]) => {
+    const n1 = graph.nodes[idx1]
+    const n2 = graph.nodes[idx2]
+
+    // Calculate angle of the edge
+    const dx = n2.x - n1.x
+    const dy = n2.y - n1.y
+    const angleRad = Math.atan2(dy, dx)
+    const angleDeg = angleRad * (180 / Math.PI)
+
+    // Normalize angle to 0-360
+    const normalizedAngle = ((angleDeg % 360) + 360) % 360
+
+    // Check if close to horizontal (0° or 180°)
+    const isNearHorizontal =
+      normalizedAngle <= snapTolerance ||
+      normalizedAngle >= (360 - snapTolerance) ||
+      Math.abs(normalizedAngle - 180) <= snapTolerance
+
+    // Check if close to vertical (90° or 270°)
+    const isNearVertical =
+      Math.abs(normalizedAngle - 90) <= snapTolerance ||
+      Math.abs(normalizedAngle - 270) <= snapTolerance
+
+    if (isNearHorizontal) {
+      // Make perfectly horizontal - average the y coordinates
+      const avgY = (n1.y + n2.y) / 2
+      n1.y = avgY
+      n2.y = avgY
+    } else if (isNearVertical) {
+      // Make perfectly vertical - average the x coordinates
+      const avgX = (n1.x + n2.x) / 2
+      n1.x = avgX
+      n2.x = avgX
+    }
+  })
+
+  // Remove duplicate edges (edges connecting the same nodes)
+  const uniqueEdges = new Map()
+  graph.edges.forEach(([idx1, idx2]) => {
+    // Create a key that's the same regardless of edge direction
+    const key = [Math.min(idx1, idx2), Math.max(idx1, idx2)].join('-')
+    uniqueEdges.set(key, [idx1, idx2])
+  })
+  graph.edges = Array.from(uniqueEdges.values())
+
   console.log('Graph:', graph)
   console.log('Nodes:', graph.nodes.length)
   console.log('Edges:', graph.edges.length)
 
-  // Export the canvas as SVG
-  // const svg = paper.project.exportSVG({ asString: true })
-  // console.log('SVG Output:', svg)
+  return graph
+}
 
-  // // Download SVG file
-  // const svgBlob = new Blob([svg], { type: 'image/svg+xml' })
-  // const svgUrl = URL.createObjectURL(svgBlob)
-  // const svgLink = document.createElement('a')
-  // svgLink.href = svgUrl
-  // svgLink.download = 'drawing.svg'
-  // svgLink.click()
-  // URL.revokeObjectURL(svgUrl)
+const findDoors = (doorPaths, graph) => {
+  const doors = []
 
-  // // Export and download as PNG
-  // canvas.value.toBlob((blob) => {
-  //   const pngUrl = URL.createObjectURL(blob)
-  //   const pngLink = document.createElement('a')
-  //   pngLink.href = pngUrl
-  //   pngLink.download = 'drawing.png'
-  //   pngLink.click()
-  //   URL.revokeObjectURL(pngUrl)
-  // }, 'image/png')
+  // Helper function to calculate distance between point and line segment
+  const distanceToSegment = (point, lineStart, lineEnd) => {
+    const dx = lineEnd.x - lineStart.x
+    const dy = lineEnd.y - lineStart.y
+    const lengthSquared = dx * dx + dy * dy
 
-  // // Download graph as JSON
-  // const graphJson = JSON.stringify(graph, null, 2)
-  // const graphBlob = new Blob([graphJson], { type: 'application/json' })
-  // const graphUrl = URL.createObjectURL(graphBlob)
-  // const graphLink = document.createElement('a')
-  // graphLink.href = graphUrl
-  // graphLink.download = 'graph.json'
-  // graphLink.click()
-  // URL.revokeObjectURL(graphUrl)
+    if (lengthSquared === 0) {
+      // Line segment is a point
+      const distX = point.x - lineStart.x
+      const distY = point.y - lineStart.y
+      return Math.sqrt(distX * distX + distY * distY)
+    }
+
+    // Calculate projection of point onto line segment
+    let t = ((point.x - lineStart.x) * dx + (point.y - lineStart.y) * dy) / lengthSquared
+    t = Math.max(0, Math.min(1, t))
+
+    const projectedX = lineStart.x + t * dx
+    const projectedY = lineStart.y + t * dy
+
+    const distX = point.x - projectedX
+    const distY = point.y - projectedY
+    return {
+      distance: Math.sqrt(distX * distX + distY * distY),
+      projected: { x: projectedX, y: projectedY }
+    }
+  }
+
+  // Helper function to snap point to nearest edge
+  const snapToNearestEdge = (point) => {
+    let minDistance = Infinity
+    let snappedPoint = point
+
+    graph.edges.forEach(([idx1, idx2]) => {
+      const n1 = graph.nodes[idx1]
+      const n2 = graph.nodes[idx2]
+      const result = distanceToSegment(point, n1, n2)
+
+      if (result.distance < minDistance) {
+        minDistance = result.distance
+        snappedPoint = result.projected
+      }
+    })
+
+    return snappedPoint
+  }
+
+  // Process each door path
+  doorPaths.forEach((path) => {
+    if (!path.segments || path.segments.length < 2) return
+
+    const segments = path.segments
+    const startPoint = {
+      x: segments[0].point.x,
+      y: segments[0].point.y
+    }
+    const endPoint = {
+      x: segments[segments.length - 1].point.x,
+      y: segments[segments.length - 1].point.y
+    }
+
+    // Snap both endpoints to nearest wall edges
+    const snappedStart = snapToNearestEdge(startPoint)
+    const snappedEnd = snapToNearestEdge(endPoint)
+
+    doors.push({
+      start: snappedStart,
+      end: snappedEnd,
+      original: {
+        start: startPoint,
+        end: endPoint
+      }
+    })
+  })
+
+  console.log('Doors:', doors)
+  return doors
 }
 
 onBeforeUnmount(() => {

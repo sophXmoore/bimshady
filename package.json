@@ -12,6 +12,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.69.0",
     "@mdi/font": "^7.4.47",
     "paper": "^0.12.18",
     "pinia": "^3.0.3",
