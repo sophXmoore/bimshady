@@ -237,6 +237,28 @@ const send = async () => {
 
     console.log('final', finalJSON)
 
+    // Send to server
+    try {
+      const response = await fetch('http://localhost:8080/api/import-sketch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(finalJSON)
+      })
+
+      const result = await response.json()
+      console.log('Server response:', result)
+
+      if (result.Success) {
+        console.log('Successfully sent to Revit server')
+      } else {
+        console.error('Server error:', result.Error)
+      }
+    } catch (fetchError) {
+      console.error('Failed to send to server:', fetchError)
+    }
+
   } catch (error) {
     console.error('Error processing architectural sketch:', error)
   }
