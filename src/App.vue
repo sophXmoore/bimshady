@@ -193,8 +193,8 @@ const send = async () => {
     let length = Math.max(dimsBoundingBox.height, dimsBoundingBox.width)
     console.log('dims', dimsBoundingBox, length)
 
-    // Extract dimension text/number from paths using Anthropic
-    const dimensionData = await extractDimensionNumber(dimsPath, apiKey)
+    // Extract dimension text/number from image using Anthropic
+    const dimensionData = await extractDimensionNumber(dimsPath, dimsBoundingBox, canvas.value, apiKey)
     console.log('Extracted dimension data:', dimensionData)
 
     // Create graph from wall paths
@@ -260,24 +260,44 @@ const send = async () => {
   }
 }
 
-const extractDimensionNumber = async (dimPaths, apiKey) => {
+const extractDimensionNumber = async (dimPaths, boundingBox, canvasElement, apiKey) => {
   if (!dimPaths || dimPaths.length === 0) {
     console.log('No dimension paths to process')
     return null
   }
 
-  // Extract all points from dimension paths
-  const pathsData = dimPaths.map(path => {
-    if (!path.segments || path.segments.length === 0) return null
+  if (!boundingBox || boundingBox.width === 0 || boundingBox.height === 0) {
+    console.log('Invalid bounding box')
+    return null
+  }
 
-    return {
-      points: path.segments.map(segment => ({
-        x: segment.point.x,
-        y: segment.point.y
-      }))
-    }
-  }).filter(p => p !== null)
-  console.log('pathsData', pathsData)
+  // Ensure paper.js view is updated
+  paper.view.update()
+
+  // Extract image region from canvas based on bounding box
+  // Add some padding around the bounding box
+  const padding = 20
+  const x = Math.max(0, Math.floor(boundingBox.minX - padding))
+  const y = Math.max(0, Math.floor(boundingBox.minY - padding))
+  const width = Math.min(canvasElement.width - x, Math.ceil(boundingBox.width + padding * 2))
+  const height = Math.min(canvasElement.height - y, Math.ceil(boundingBox.height + padding * 2))
+
+  // Create a temporary canvas to extract the region
+  const tempCanvas = document.createElement('canvas')
+  tempCanvas.width = width
+  tempCanvas.height = height
+  const tempCtx = tempCanvas.getContext('2d')
+
+  // Draw the region from the paper.js canvas to the temporary canvas
+  tempCtx.drawImage(
+    canvasElement,
+    x, y, width, height,  // Source region
+    0, 0, width, height   // Destination region
+  )
+
+  // Convert to base64 image
+  const imageDataUrl = tempCanvas.toDataURL('image/png')
+  console.log('Extracted image region from canvas')
 
   const client = new Anthropic({
     apiKey,
@@ -297,34 +317,30 @@ const extractDimensionNumber = async (dimPaths, apiKey) => {
     }
   }
 
-  const prompt = `I have drawn dimension annotation paths (lines forming text/numbers) in an architectural drawing and annotation lines. Here are the path coordinates:
+  // Convert data URL to base64 string (remove the data:image/png;base64, prefix)
+  const base64Image = imageDataUrl.split(',')[1]
 
-**PATH POINTS:**
-${JSON.stringify(pathsData, null, 2)}
+  const prompt = `I have an image showing dimension annotation lines and text/numbers drawn in an architectural drawing. The magenta/pink lines form dimension annotations.
 
 **TASK:**
-Analyze these path coordinates and determine what text/number they are trying to represent.
+Analyze this image and determine what dimension text/number is being represented.
 
 **INSTRUCTIONS:**
-1. Some of the points form strokes that represent dimension text (e.g., "24", "12.5", "10'", "24'-6\"", etc.) but some of the points are just dimension lines.
-2. Analyze the path patterns to determine what characters/numbers are being drawn
-3. Return the exact text as dimension_value
-4. If you can parse it to a number, also return "dimension_value"
-
-**COORDINATE SYSTEM:**
-- Each path is a series of (x, y) points
-- Points are connected in order to form strokes
-- Multiple paths may form a single character or multiple characters
+1. The image shows dimension annotation lines and text/numbers drawn in magenta/pink color
+2. Some lines are just dimension lines (extension lines), while others form text/numbers
+3. Identify what dimension value is being shown (e.g., "24", "12.5", "10'", "24'-6\"", etc.)
+4. Return the exact text as "dimension_text"
+5. If you can parse it to a number (in feet), also return "dimension_value"
 
 **EXAMPLES:**
-- If paths form "24'", return: {"dimension_text": "24'", "dimension_value": 24}
-- If paths form "12'-6\"", return: {"dimension_text": "12'-6\"", "dimension_value": 12.5}
-- If paths form "10", return: {"dimension_text": "10", "dimension_value": 10}
+- If the image shows "24'", return: {"dimension_text": "24'", "dimension_value": 24}
+- If the image shows "12'-6\"", return: {"dimension_text": "12'-6\"", "dimension_value": 12.5}
+- If the image shows "10", return: {"dimension_text": "10", "dimension_value": 10}
 
-Analyze the paths and extract the dimension text.
+Analyze the image and extract the dimension text.
 `
 
-  console.log("Extracting dimension text with Anthropic API...")
+  console.log("Extracting dimension text from image with Anthropic API...")
   const response = await client.beta.messages.create({
     model: "claude-sonnet-4-5",
     max_tokens: 2000,
@@ -334,6 +350,14 @@ Analyze the paths and extract the dimension text.
       {
         role: "user",
         content: [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/png",
+              data: base64Image
+            }
+          },
           {
             type: "text",
             text: prompt
@@ -362,7 +386,7 @@ Analyze the paths and extract the dimension text.
 
 const scaleToRealWorld = (wallGraph, doors, dimensionValue, boundingBoxLength) => {
   // Calculate scale factor: real_world_units per pixel
-  const scaleFactor = 12 / boundingBoxLength
+  const scaleFactor = dimensionValue / boundingBoxLength
 
   console.log(`Scale factor: ${dimensionValue} units / ${boundingBoxLength} pixels = ${scaleFactor} units per pixel`)
 
